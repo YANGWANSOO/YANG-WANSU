@@ -1,0 +1,1176 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>증강 아레나</title>
+<style>
+  html,body{margin:0;height:100%;background:#07080c;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{display:block;width:min(100vw,177.78vh);height:auto;aspect-ratio:16/9;background:#111}
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+/* =========================================================
+   증강 아레나 - 2D 사이드뷰 대전 격투 게임 (단일 HTML)
+   구조: Sound / Input / 컨트롤러(Player, AI) / Fighter / Stage
+         / Augment / Scene(Loading, Select, Battle, Augment, GameOver) / Game
+   ========================================================= */
+
+// ---------- 상수와 유틸 ----------
+const W = 960, H = 540, GROUND = 455, WALL_L = 36, WALL_R = 924;
+const GRAV = 0.85, STEP = 1 / 60, BUFFER = 9; // 입력 버퍼 9프레임(약 0.15초)
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const overlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+function rr(ctx, x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function txt(ctx, s, x, y, size, color, align = 'center', stroke = true) {
+  ctx.font = `bold ${size}px "Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  if (stroke) { ctx.lineWidth = Math.max(3, size / 6); ctx.strokeStyle = 'rgba(0,0,0,.8)'; ctx.lineJoin = 'round'; ctx.strokeText(s, x, y); }
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+
+// ---------- 효과음 (Web Audio, 외부 파일 없음) ----------
+const Sound = {
+  ctx: null, master: null,
+  unlock() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+        this.ctx = new AC(); this.master = this.ctx.createGain(); this.master.gain.value = 0.45;
+        this.master.connect(this.ctx.destination);
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+    } catch (e) { /* 소리 없이 진행 */ }
+  },
+  tone(freq, dur, type = 'square', vol = 0.15, slide = 0) {
+    const c = this.ctx; if (!c) return;
+    const o = c.createOscillator(), g = c.createGain(), t = c.currentTime;
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.linearRampToValueAtTime(Math.max(20, freq + slide), t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(this.master); o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol = 0.2, freq = 1500) {
+    const c = this.ctx; if (!c) return;
+    const len = Math.max(1, Math.floor(c.sampleRate * dur)), b = c.createBuffer(1, len, c.sampleRate), d = b.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = b; f.type = 'bandpass'; f.frequency.value = freq; g.gain.value = vol;
+    s.connect(f); f.connect(g); g.connect(this.master); s.start();
+  },
+  // 낮은 음이 툭 떨어지는 '쿵' (타격의 무게감)
+  thump(freq, dur, vol) {
+    const c = this.ctx; if (!c) return;
+    const o = c.createOscillator(), g = c.createGain(), t = c.currentTime;
+    o.type = 'sine'; o.frequency.setValueAtTime(freq, t); o.frequency.exponentialRampToValueAtTime(40, t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(this.master); o.start(t); o.stop(t + dur + 0.02);
+  },
+  // 약한 타격: 짧고 밝은 '팍' / 강한 타격(피해 8 이상): 낮은 '쿵' + 부서지는 소리
+  hit(d) {
+    const heavy = d >= 8;
+    this.noise(0.05 + d * 0.005, 0.45, heavy ? 700 : 1300 + Math.random() * 500);
+    this.thump(heavy ? 130 : 180, heavy ? 0.24 : 0.12, heavy ? 0.55 : 0.3);
+    if (heavy) this.noise(0.14, 0.25, 320);
+  },
+  block() { this.tone(1200, 0.05, 'triangle', 0.14); this.noise(0.03, 0.2, 4000); this.thump(220, 0.06, 0.15); },
+  land() { this.thump(95, 0.14, 0.3); this.noise(0.06, 0.12, 500); },
+  ding() { this.tone(1320, 0.1, 'triangle', 0.1); setTimeout(() => this.tone(1760, 0.16, 'triangle', 0.1), 70); },
+  swing() { this.noise(0.05, 0.07, 2500); },
+  dash() { this.noise(0.1, 0.1, 1200); },
+  jump() { this.tone(300, 0.08, 'sine', 0.08, 200); },
+  orb() { this.tone(520, 0.25, 'sawtooth', 0.08, -300); },
+  shot() { this.tone(900, 0.08, 'square', 0.06, -500); },
+  // 필살기 컷인: 차오르는 음 + 바람 소리, 궁극기는 더 길고 낮은 울림까지
+  superStart(ult) {
+    this.tone(ult ? 150 : 250, ult ? 0.9 : 0.5, 'sawtooth', 0.12, ult ? 900 : 500);
+    this.noise(ult ? 0.8 : 0.45, 0.16, 2600);
+    this.tone(ult ? 1200 : 900, 0.12, 'square', 0.06);
+    if (ult) this.thump(70, 0.9, 0.45);
+  },
+  select() { this.tone(660, 0.05, 'square', 0.06); },
+  confirm() { this.tone(880, 0.12, 'square', 0.08, 200); },
+  ko() { this.thump(90, 0.7, 0.6); this.noise(0.45, 0.35, 450); this.tone(320, 0.9, 'sawtooth', 0.12, -260); },
+};
+
+// ---------- 입력 (e.code 사용: 한글 입력 상태에서도 동작) ----------
+class Input {
+  constructor() {
+    this.keys = new Set(); this.buf = {}; this.frame = 0;
+    this.paused = false; // 타격 정지·필살기 연출·일시정지 중에는 버퍼 시간이 흐르지 않음
+    const map = e => {
+      if (e.code && e.code.startsWith('Key')) return e.code.slice(3).toLowerCase();
+      if (e.code === 'Space') return ' ';
+      if (e.code === 'Enter') return 'enter';
+      return (e.key || '').toLowerCase();
+    };
+    addEventListener('keydown', e => {
+      const k = map(e);
+      if ((k.length === 1 && 'wasdjkluiph '.includes(k)) || k === 'enter') e.preventDefault();
+      if (!e.repeat && !this.keys.has(k)) this.buf[k] = this.frame;
+      this.keys.add(k); Sound.unlock();
+    });
+    addEventListener('keyup', e => this.keys.delete(map(e)));
+    addEventListener('blur', () => this.keys.clear());
+  }
+  held(k) { return this.keys.has(k); }
+  pressed(k) { const f = this.buf[k]; return f !== undefined && this.frame - f <= BUFFER; }
+  consume(k) { delete this.buf[k]; }
+  tap(k) { if (this.pressed(k)) { this.consume(k); return true; } return false; }
+  clear() { this.buf = {}; }
+  tick() { if (!this.paused) this.frame++; }
+}
+
+// ---------- 캐릭터 / 기술 데이터 ----------
+// box: [앞쪽 x, 발 기준 y, 너비, 높이]  s: 준비, a: 공격 판정, r: 후딜레이 (프레임)
+const MOVES = {
+  j1:      { s: 4, a: 3, r: 9,  dmg: 4,   kbx: 2,   kby: 0,   hs: 16, box: [18, -98, 50, 22] },
+  j2:      { s: 4, a: 3, r: 10, dmg: 4,   kbx: 2.5, kby: 0,   hs: 17, box: [18, -92, 54, 22] },
+  j2b:     { s: 4, a: 3, r: 10, dmg: 3.5, kbx: 2.5, kby: 0,   hs: 17, box: [18, -84, 54, 22] },
+  j3:      { s: 7, a: 4, r: 18, dmg: 8,   kbx: 9,   kby: -7,  hs: 24, box: [16, -104, 62, 32], kd: true, lunge: 3, shake: 3 },
+  j4:      { s: 6, a: 4, r: 18, dmg: 7,   kbx: 8,   kby: -8,  hs: 24, box: [16, -104, 60, 34], kd: true, lunge: 4, shake: 3 },
+  lowJ:    { s: 6, a: 3, r: 12, dmg: 5,   kbx: 3,   kby: 0,   hs: 18, box: [14, -30, 66, 24], kd: true, crouch: true },
+  airJ:    { s: 4, a: 8, r: 6,  dmg: 6,   kbx: 3,   kby: -2,  hs: 18, box: [8, -75, 52, 40], air: true },
+  thrust:  { s: 7, a: 6, r: 16, dmg: 8,   kbx: 6,   kby: -2,  hs: 22, box: [24, -90, 72, 20], lunge: 9 },
+  dashAtk: { s: 3, a: 6, r: 14, dmg: 9,   kbx: 7,   kby: -6,  hs: 22, box: [18, -86, 62, 32], lunge: 7, kd: true },
+  upJ:     { s: 5, a: 4, r: 12, dmg: 6,   kbx: 2,   kby: -6,  hs: 20, box: [-6, -175, 54, 75] },
+  // 원거리 공격 (U). 한 사람당 화면에 1발만 쏠 수 있음. y: 발 기준 발사 높이, vy: 세로 속도, aim: 팔 방향
+  shot:    { s: 9,  a: 0, r: 20, aim: { x: 46, y: -4 },  proj: { r: 9, speed: 11, vy: 0,  y: -88, life: 70, small: true, hit: { dmg: 5, kbx: 4, kby: 0,  hs: 18 } } },
+  lowShot: { s: 11, a: 0, r: 22, aim: { x: 44, y: 22 },  crouch: true, proj: { r: 9, speed: 9, vy: 0, y: -16, life: 70, small: true, hit: { dmg: 5, kbx: 3, kby: 0, hs: 18, kd: true } } },
+  upShot:  { s: 9,  a: 0, r: 20, aim: { x: 30, y: -40 }, proj: { r: 9, speed: 7,  vy: -7, y: -120, life: 50, small: true, hit: { dmg: 6, kbx: 2, kby: -7, hs: 20 } } },
+  airShot: { s: 7,  a: 0, r: 14, aim: { x: 38, y: 22 },  air: true, proj: { r: 9, speed: 8, vy: 5, y: -60, life: 60, small: true, hit: { dmg: 6, kbx: 3, kby: 3, hs: 20, kd: true } } },
+  // 필살기 (게이지 1칸 = 100)
+  rush:     { s: 10, a: 30, r: 16, dmg: 5,   kbx: 3,  kby: 0,  hs: 22, box: [8, -110, 74, 90], lunge: 8, rehit: 6, cost: 100, super: true, finalLaunch: true },
+  teleport: { s: 12, a: 24, r: 14, dmg: 4.6, kbx: 1,  kby: 0,  hs: 20, box: [6, -110, 64, 90], rehit: 5, cost: 100, super: true, teleport: true, finalLaunch: true },
+  wave:     { s: 18, a: 8,  r: 24, dmg: 26,  kbx: 12, kby: -9, hs: 30, box: [20, -110, 420, 110], cost: 100, super: true, kd: true, wave: true, shake: 14 },
+  orb:      { s: 12, a: 0,  r: 18, cost: 100, super: true, proj: { r: 20, hit: { dmg: 14, kbx: 7, kby: -7, hs: 26, kd: true } } },
+  // 궁극기 (게이지 2칸 = 200)
+  ult:      { s: 14, a: 44, r: 24, dmg: 4.4, kbx: 1.5, kby: 0, hs: 20, box: [20, -125, 1000, 95], rehit: 4, cost: 200, super: true, ult: true, finalLaunch: true, shake: 4 },
+};
+
+const CHARS = [
+  { id: 'kai', name: '카이', type: '밸런스형', color: '#4ea8ff', dark: '#1e5fa6', alt: '#5fe0c8', altDark: '#1f8a78',
+    hp: 100, speed: 4.3, power: 1.0, jump: 16, chain: ['j1', 'j2', 'j3'], special: 'rush',
+    specialName: '질풍 연속 베기', orbName: '창공파', ultName: '천공 일섬', orbSpeed: 10, draw: drawKai,
+    desc: '모든 능력이 고른 정석 파이터' },
+  { id: 'mira', name: '미라', type: '스피드형', color: '#ff5fa2', dark: '#a3245e', alt: '#ffd84a', altDark: '#a8861a',
+    hp: 82, speed: 5.7, power: 0.85, jump: 17, chain: ['j1', 'j2', 'j2b', 'j4'], special: 'teleport',
+    specialName: '섬광 순보 연타', orbName: '핑크 스파크', ultName: '만화경 난무', orbSpeed: 13, draw: drawMira,
+    desc: '빠른 발놀림과 4단 콤보' },
+  { id: 'gor', name: '고르', type: '파워형', color: '#ffa53c', dark: '#a85f12', alt: '#b8c0d0', altDark: '#5a6272',
+    hp: 125, speed: 3.3, power: 1.3, jump: 14.5, chain: ['j1', 'j2', 'j3'], special: 'wave',
+    specialName: '대지 충격파', orbName: '바위 포탄', ultName: '산맥 붕괴', orbSpeed: 8, draw: drawGor,
+    desc: '느리지만 한 방이 무거운 거한' },
+];
+
+function getMove(f, id) {
+  const key = id === 'special' ? f.def.special : id;
+  const base = MOVES[key]; if (!base) return null;
+  const m = { ...base, id: key };
+  const ci = f.def.chain.indexOf(id); if (ci >= 0) m.chainIdx = ci;
+  if (key === 'orb') m.proj = { ...base.proj, speed: f.def.orbSpeed };
+  if (!m.cost) { // 캐릭터별 기술 속도 차이
+    if (f.def.id === 'mira') { m.s = Math.max(2, m.s - 1); m.r = Math.max(4, m.r - 2); }
+    else if (f.def.id === 'gor') { m.s += 1; m.r += 2; }
+  }
+  return m;
+}
+
+// ---------- 컨트롤러 ----------
+const NO_INPUT = { left: false, right: false, up: false, down: false, jump: false, press: () => false, consume: () => {} };
+class PlayerController {
+  constructor(input) { this.input = input; }
+  read() {
+    const i = this.input;
+    return { left: i.held('a'), right: i.held('d'), up: i.held('w'), down: i.held('s'), jump: i.held('k'),
+             press: k => i.pressed(k), consume: k => i.consume(k) };
+  }
+}
+
+// 상태 기반 NPC AI: react(반응 프레임), block(방어 확률), combo(콤보 확률), aggr(공격 빈도), dash(대시 확률)
+class AI {
+  constructor(me, opp, params, scene) {
+    this.me = me; this.opp = opp; this.p = params; this.scene = scene;
+    this.plan = null; this.pt = 0; this.wait = 30; this.pend = {}; this.sawProj = false;
+    this.reactF = Math.max(2, Math.round(params.react / 3));
+  }
+  set(hold, seq, len, attack = false) {
+    this.plan = { hold: Object.assign({ left: false, right: false, up: false, down: false }, hold), seq, len, attack };
+    this.pt = 0;
+  }
+  read() {
+    const me = this.me, o = this.opp, p = this.p, r = Math.random;
+    for (const k in this.pend) if (--this.pend[k] <= 0) delete this.pend[k];
+    const dx = o.x - me.x, dist = Math.abs(dx);
+    const toward = dx > 0 ? 'right' : 'left', away = dx > 0 ? 'left' : 'right';
+    const proj = this.scene.projectiles.find(q => q.owner !== me && Math.abs(q.x - me.x) < 260 && Math.sign(me.x - q.x) === Math.sign(q.vx));
+    const threat = (o.state === 'attack' && o.t === this.reactF && dist < 240) || (proj && !this.sawProj);
+    this.sawProj = !!proj;
+    if (threat && !(this.plan && this.plan.attack) && me.canAct()) {
+      if (r() < p.block) {
+        const left = (o.state === 'attack' && o.move) ? o.move.s + o.move.a + o.move.r - o.t + 6 : 30;
+        this.set({ down: true }, [], left);
+      } else if (r() < p.dash * 0.5) this.set({ [away]: true }, [[0, 'l']], 20);
+    }
+    if (!this.plan) { if (this.wait > 0) this.wait--; else this.decide(dist, toward, away); }
+    let hold = { left: false, right: false, up: false, down: false };
+    if (this.plan) {
+      const pl = this.plan; hold = pl.hold;
+      for (const [at, k] of pl.seq) if (at === this.pt) this.pend[k] = 6;
+      this.pt++;
+      if (this.pt >= pl.len) { this.plan = null; this.wait = Math.round(rand(0, p.react)); }
+    }
+    const pend = this.pend;
+    return { ...hold, jump: true, press: k => !!pend[k], consume: k => { delete pend[k]; } };
+  }
+  decide(dist, toward, away) {
+    const me = this.me, o = this.opp, p = this.p, r = Math.random;
+    if (!me.canAct()) { this.wait = 2; return; }
+    if (me.meter >= 200 && dist < 600 && r() < 0.3) { this.set({ down: true }, [[0, 'i']], 70, true); return; }
+    if (me.meter >= 100 && r() < 0.2) {
+      if (dist > 260) this.set({ up: true }, [[0, 'i']], 40, true);
+      else if (dist < 200) this.set({}, [[0, 'i']], 60, true);
+      else this.set({ [toward]: true }, [], 10);
+      return;
+    }
+    if (!o.grounded && dist < 150 && r() < p.aggr) { this.set({ up: true }, [[0, r() < 0.5 ? 'j' : 'u']], 26, true); return; }
+    if (dist > 170) {
+      const x = r(), shoot = 0.12 + p.aggr * 0.12; // 거리가 멀면 원거리 공격도 섞어 씀
+      if (x < shoot && this.scene.canShoot(me)) this.set({}, [[0, 'u']], 34, true);
+      else if (x < shoot + p.dash) this.set({ [toward]: true }, [[0, 'l']], 18);
+      else if (x < shoot + p.dash + 0.08) this.set({ [toward]: true }, [[0, 'k'], [12, r() < 0.5 ? 'j' : 'u']], 34, true);
+      else this.set({ [toward]: true }, [], Math.round(rand(10, 24)));
+      return;
+    }
+    if (dist <= 120 && r() < p.aggr) {
+      const x = r();
+      if (x < 0.45) {
+        let n = 1; const max = me.def.chain.length;
+        while (n < max && r() < p.combo) n++;
+        const seq = []; for (let i = 0; i < n; i++) seq.push([i * 8, 'j']);
+        this.set({}, seq, n * 8 + 20, true);
+      } else if (x < 0.6) this.set({ down: true }, [[0, r() < 0.6 ? 'j' : 'u']], 30, true);
+      else if (x < 0.72) this.set({}, [[0, 'u']], 36, true);
+      else if (x < 0.84) this.set({ [toward]: true }, [[0, 'j']], 30, true);
+      else this.set({ up: true }, [[0, 'u']], 34, true);
+      return;
+    }
+    const x = r();
+    if (x < 0.3) this.set({ [away]: true }, [], Math.round(rand(8, 20)));
+    else if (x < 0.4) this.set({ [away]: true }, [[0, 'l']], 20);
+    else if (x < 0.5) this.set({ down: true }, [], 20);
+    else this.set({ [toward]: true }, [], Math.round(rand(6, 14)));
+  }
+}
+
+// ---------- 파이터 ----------
+class Fighter {
+  constructor(def, x, facing, o = {}) {
+    Object.assign(this, { def, x, y: GROUND, vx: 0, vy: 0, facing, scale: o.scale || 1,
+      color: o.color || def.color, dark: o.dark || def.dark, name: o.name || def.name, isBoss: !!o.boss });
+    this.maxHp = def.hp * (o.hpMul || 1);
+    this.hp = o.hp !== undefined ? Math.min(o.hp, this.maxHp) : this.maxHp; this.shownHp = this.hp;
+    this.atkMul = o.atkMul || 1; this.spdMul = o.spdMul || 1; this.meterMul = o.meterMul || 1;
+    this.aug = o.aug || {}; this.meter = o.meter || 0;
+    this.state = 'idle'; this.t = 0; this.move = null; this.hitDone = false;
+    this.inv = 0; this.stun = 0; this.grounded = true; this.airJumps = 0; this.dashDir = 1;
+    this.boostT = 0; this.boosted = false; this.combo = 0; this.anim = 0; this.kdOnLand = false; this.flash = 0;
+    this.jumpHeld = false;                  // 점프 키를 누르고 있는 동안 true (가변 점프)
+    this.chainGrace = 0; this.chainFrom = -1; // 콤보가 끝난 뒤에도 다음 타를 이어 줄 여유 시간
+  }
+  hurtbox() {
+    const s = this.scale, w = 46 * s;
+    let h = (this.state === 'attack' && this.move && this.move.crouch ? 82 : 128) * s;
+    if (this.state === 'knock' || (this.state === 'ko' && this.grounded)) h = 30 * s;
+    return { x: this.x - w / 2, y: this.y - h, w, h };
+  }
+  hitbox() {
+    const m = this.move, s = this.scale; if (!m || !m.box) return null;
+    const bx = m.box[0] * s, by = m.box[1] * s, bw = m.box[2] * s, bh = m.box[3] * s;
+    return { x: this.facing > 0 ? this.x + bx : this.x - bx - bw, y: this.y + by, w: bw, h: bh };
+  }
+  active() { const m = this.move; return this.state === 'attack' && m && m.box && this.t >= m.s && this.t < m.s + m.a; }
+  canAct() { return ['idle', 'walk', 'guard', 'air'].includes(this.state); }
+  isGuarding(srcX) {
+    return (this.state === 'guard' || this.state === 'guardstun') && this.grounded && Math.sign(srcX - this.x) === this.facing;
+  }
+  startMove(id, sc) {
+    const m = getMove(this, id); if (!m) return false;
+    if (m.cost) { if (this.meter < m.cost) return false; this.meter -= m.cost; }
+    this.move = m; this.state = 'attack'; this.t = 0; this.hitDone = false;
+    this.boosted = this.boostT > 0; this.boostT = 0;
+    if (m.super) sc.startSuper(this, m);
+    Sound.swing();
+    return true;
+  }
+  update(c, opp, sc) {
+    this.anim++;
+    if (this.inv > 0) this.inv--;
+    if (this.boostT > 0) this.boostT--;
+    if (this.flash > 0) this.flash--;
+    if (this.chainGrace > 0) this.chainGrace--;
+    // 가변 점프: 올라가는 도중 K를 떼면 상승 속도를 깎아 낮게 뜀
+    if (this.jumpHeld) {
+      const rising = this.vy < 0 && (this.state === 'air' || (this.state === 'attack' && this.move && this.move.air));
+      if (!rising) this.jumpHeld = false;
+      else if (!c.jump) { this.vy = Math.max(this.vy, -this.def.jump * 0.45); this.jumpHeld = false; }
+    }
+    switch (this.state) {
+      case 'ko': break;
+      case 'knock': this.t++; if (this.t >= 44) { this.state = 'idle'; this.inv = 14; } break;
+      case 'hit': this.stun--; if (this.grounded && this.stun <= 0) this.state = 'idle'; break;
+      case 'guardstun': this.stun--; if (this.stun <= 0) this.state = c.down ? 'guard' : 'idle'; break;
+      case 'dash': {
+        this.t++;
+        this.vx = this.dashDir * this.def.speed * this.spdMul * 2.6 * (this.t < 12 ? 1 : 0.4);
+        if (this.t <= 8) this.inv = Math.max(this.inv, 1);
+        if (c.press('j')) { c.consume('j'); if (this.aug.dashBoost) this.boostT = 1; this.startMove('dashAtk', sc); break; }
+        if (this.t >= 16) { this.state = 'idle'; if (this.aug.dashBoost) this.boostT = 60; }
+        break;
+      }
+      case 'backstep':
+        this.t++; this.vx = -this.facing * 7 * (1 - this.t / 18);
+        if (this.t <= 14) this.inv = Math.max(this.inv, 1);
+        if (this.t >= 18) this.state = 'idle';
+        break;
+      case 'attack': this.runMove(c, sc, opp); break;
+      default: this.free(c, opp, sc);
+    }
+    this.physics(sc);
+  }
+  free(c, opp, sc) {
+    const sp = this.def.speed * this.spdMul;
+    if (this.grounded) {
+      this.facing = opp.x >= this.x ? 1 : -1;
+      const fwd = this.facing > 0 ? c.right : c.left, back = this.facing > 0 ? c.left : c.right;
+      if (c.press('i')) {
+        c.consume('i');
+        const id = c.down ? 'ult' : c.up ? 'orb' : 'special';
+        if (this.startMove(id, sc)) return;
+        sc.text(this.x, this.y - 150 * this.scale, '게이지 부족', '#bbb', 16);
+      }
+      if (c.press('k')) { // 점프를 먼저 처리해 K+J / K+U 동시 입력이 공중 공격으로 이어지게 함
+        c.consume('k'); this.vy = -this.def.jump; this.grounded = false; this.state = 'air'; this.airJumps = 0; this.jumpHeld = true;
+        this.vx = (c.left ? -1 : c.right ? 1 : 0) * sp * 1.1; sc.dust(this.x, this.y); Sound.jump(); return;
+      }
+      if (c.press('u') && sc.canShoot(this)) { c.consume('u'); this.startMove(c.down ? 'lowShot' : c.up ? 'upShot' : 'shot', sc); return; }
+      if (c.press('j')) {
+        c.consume('j');
+        // 콤보 여유 시간 안이면 앞 + J여도 돌진 찌르기 대신 다음 타로 이어짐
+        const next = this.chainGrace > 0 && !c.down && !c.up ? this.def.chain[this.chainFrom + 1] : null;
+        this.chainGrace = 0;
+        this.startMove(next || (c.down ? 'lowJ' : c.up ? 'upJ' : fwd ? 'thrust' : this.def.chain[0]), sc);
+        return;
+      }
+      if (c.press('l')) {
+        c.consume('l'); this.t = 0; Sound.dash(); sc.dust(this.x, this.y);
+        if (back) this.state = 'backstep';
+        else { this.state = 'dash'; this.dashDir = c.left ? -1 : c.right ? 1 : this.facing; }
+        return;
+      }
+      if (c.down) { this.state = 'guard'; this.vx = 0; return; }
+      if (c.left || c.right) {
+        const dir = c.right ? 1 : -1; this.state = 'walk';
+        this.vx = dir * sp * (dir === this.facing ? 1 : 0.8);
+      } else { this.state = 'idle'; this.vx = 0; }
+    } else {
+      this.state = 'air';
+      if (c.press('j')) { c.consume('j'); this.startMove('airJ', sc); return; }
+      if (c.press('u') && sc.canShoot(this)) { c.consume('u'); this.startMove('airShot', sc); return; }
+      if (c.press('k') && this.aug.doubleJump && this.airJumps < 1) {
+        c.consume('k'); this.airJumps++; this.vy = -this.def.jump * 0.85; this.jumpHeld = true; sc.dust(this.x, this.y + 10); Sound.jump();
+      }
+      const dir = c.left ? -1 : c.right ? 1 : 0;
+      this.vx = lerp(this.vx, dir * sp * 1.1, 0.08);
+    }
+  }
+  runMove(c, sc, opp) {
+    const m = this.move; this.t++; const f = this.t;
+    if (m.lunge && f <= m.s + m.a) this.vx = this.facing * m.lunge * (f <= m.s ? 0.4 : 1);
+    else if (this.grounded) this.vx *= 0.75;
+    if (m.teleport && f === m.s) {
+      const side = this.x < opp.x ? 1 : -1;
+      let nx = opp.x + side * 65 * Math.max(1, opp.scale);
+      if (nx < WALL_L + 25 || nx > WALL_R - 25) nx = opp.x - side * 65;
+      sc.puff(this.x, this.y - 60, this.color);
+      this.x = clamp(nx, WALL_L + 25, WALL_R - 25); this.facing = opp.x > this.x ? 1 : -1;
+      sc.puff(this.x, this.y - 60, this.color);
+    }
+    if (m.proj && f === m.s) sc.spawnProjectile(this, m.proj);
+    if (m.rehit && f >= m.s && (f - m.s) % m.rehit === 0) this.hitDone = false;
+    // 콤보 연결: 공격 판정이 끝난 뒤(후딜레이)부터 다음 타로 넘어감. 미리 누른 J는 버퍼에 남아 있다가 이때 쓰임
+    if (m.chainIdx !== undefined && f >= m.s + m.a && c.press('j')) {
+      const next = this.def.chain[m.chainIdx + 1];
+      if (next) { c.consume('j'); this.startMove(next, sc); return; }
+    }
+    if (m.air && this.grounded && f > 2) { this.move = null; this.state = 'idle'; return; }
+    if (f >= m.s + m.a + m.r) {
+      // 후딜레이가 끝난 뒤에도 14프레임(약 0.23초) 동안은 J로 다음 타를 이어 갈 수 있음
+      if (m.chainIdx !== undefined && this.def.chain[m.chainIdx + 1]) { this.chainGrace = 14; this.chainFrom = m.chainIdx; }
+      this.move = null; this.state = this.grounded ? 'idle' : 'air';
+    }
+  }
+  physics(sc) {
+    if (!this.grounded) this.vy += GRAV;
+    this.x += this.vx; this.y += this.vy;
+    if (this.y >= GROUND) {
+      this.y = GROUND;
+      if (!this.grounded) { this.grounded = true; this.vy = 0; this.onLand(sc); }
+      this.vy = 0;
+    } else this.grounded = false;
+    if (this.grounded && ['hit', 'knock', 'ko', 'guardstun'].includes(this.state)) this.vx *= 0.85;
+    this.x = clamp(this.x, WALL_L + 20, WALL_R - 20);
+  }
+  onLand(sc) {
+    if (this.state === 'hit') {
+      if (this.kdOnLand) { this.state = 'knock'; this.t = 0; sc.dust(this.x, this.y); sc.shake = Math.max(sc.shake, 5); Sound.land(); }
+      else if (this.stun <= 0) this.state = 'idle';
+    } else if (this.state === 'air') { this.state = 'idle'; sc.dust(this.x, this.y); }
+    else if (this.state === 'ko') sc.dust(this.x, this.y);
+  }
+}
+
+// ---------- 캐릭터 그리기 (나중에 스프라이트로 교체하기 쉽게 캐릭터별 함수로 분리) ----------
+function fighterPose(f) {
+  const p = { crouch: 0, lean: 0, arm: null, leg: null, guard: false, air: !f.grounded, lying: false, walk: null, glow: false, anim: f.anim };
+  switch (f.state) {
+    case 'walk': p.walk = f.anim * 0.25; break;
+    case 'guard': case 'guardstun': p.guard = true; p.crouch = 0.3; break;
+    case 'hit': p.lean = -0.35; p.arm = { x: -12, y: 24 }; break;
+    case 'knock': p.lying = true; break;
+    case 'ko': p.lying = f.grounded; p.lean = f.grounded ? 0 : -0.6; break;
+    case 'dash': p.lean = 0.3; p.arm = { x: -18, y: 30 }; break;
+    case 'backstep': p.lean = -0.25; break;
+    case 'attack': {
+      const m = f.move, t = f.t;
+      const k = t < m.s ? -0.4 * (t / m.s) : t < m.s + m.a ? 1 : Math.max(0, 1 - (t - m.s - m.a) / m.r);
+      if (m.crouch) p.crouch = 1;
+      if (m.box) {
+        const [bx, by, bw, bh] = m.box;
+        const tx = Math.min(bx + bw * 0.7, 75), ty = by + bh / 2;
+        const useLeg = (ty > -50 && !m.air) || m.legKick;
+        const kk = Math.max(k, 0);
+        if (useLeg) {
+          const hipY = -55 + p.crouch * 20;
+          p.leg = kk === 0 ? null : { x: lerp(15, tx, kk), y: lerp(-hipY, ty - hipY, kk) };
+          p.lean = -0.15 * kk;
+        } else {
+          const shY = -94 + p.crouch * 28;
+          const dx = tx, dy = ty - shY, len = Math.hypot(dx, dy) || 1, sc = Math.min(1, 52 / len);
+          p.arm = k < 0 ? { x: -14, y: 22 } : { x: lerp(14, dx * sc, k), y: lerp(30, dy * sc, k) };
+          p.lean = 0.12 * k;
+        }
+      } else p.arm = m.aim || { x: 44, y: -6 };
+      if (m.super) p.glow = true;
+      break;
+    }
+  }
+  return p;
+}
+
+function drawBody(ctx, p, o, extra) {
+  const c = o.color, d = o.dark, lw = o.limbW, seg = o.seg;
+  ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (p.glow) { ctx.shadowColor = c; ctx.shadowBlur = 22; }
+  if (p.lying) { ctx.translate(0, -o.torsoW / 2 - 2); ctx.rotate(-Math.PI / 2); }
+  const cr = p.crouch, hipY = -55 + cr * 20, shY = -100 + cr * 28;
+  ctx.translate(0, hipY); ctx.rotate(p.lean); ctx.translate(0, -hipY);
+  const sh = { x: 2, y: shY + 6 }, hip = { x: 0, y: hipY };
+  const limb = (a, b, col, w, isLeg) => {
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, L = Math.hypot(b.x - a.x, b.y - a.y);
+    const k = Math.max(0, seg * 2 - L) * 0.7;
+    const j = isLeg ? { x: mx + k, y: my } : { x: mx - k * 0.3, y: my + k };
+    ctx.strokeStyle = col; ctx.lineWidth = w;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(j.x, j.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  };
+  let bf, ff;
+  if (p.air && !p.lying) { bf = { x: -12, y: hipY + 40 }; ff = { x: 16, y: hipY + 32 }; }
+  else if (p.walk != null) { const s = Math.sin(p.walk); bf = { x: -12 + s * 12, y: 0 }; ff = { x: 12 - s * 12, y: 0 }; }
+  else { bf = { x: -15 - cr * 6, y: 0 }; ff = { x: 15 + cr * 8, y: 0 }; }
+  if (p.leg) ff = { x: hip.x + p.leg.x, y: hip.y + p.leg.y };
+  const bob = Math.sin(p.anim * 0.08) * 2;
+  const backHand = p.guard ? { x: 22, y: shY + 14 } : { x: -10 + (p.walk != null ? -Math.sin(p.walk) * 8 : 0), y: shY + 42 };
+  const frontHand = p.guard ? { x: 28, y: shY + 4 } : p.arm ? { x: sh.x + p.arm.x, y: sh.y + p.arm.y } : { x: 16, y: shY + 38 + bob };
+  // 뒤쪽 팔다리
+  limb(sh, backHand, d, lw, false);
+  limb({ x: hip.x - 3, y: hip.y }, bf, d, lw + 1, true);
+  // 몸통
+  ctx.fillStyle = c; rr(ctx, -o.torsoW / 2, shY - 2, o.torsoW, hipY - shY + 10, 8); ctx.fill();
+  ctx.fillStyle = d; ctx.fillRect(-o.torsoW / 2, hipY - 2, o.torsoW, 6);
+  // 앞다리
+  limb({ x: hip.x + 3, y: hip.y }, ff, c, lw + 1, true);
+  // 머리
+  const hx = 3, hy = shY - o.headR - 2;
+  ctx.fillStyle = c; ctx.beginPath(); ctx.arc(hx, hy, o.headR, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#111'; ctx.fillRect(hx + o.headR * 0.3, hy - 3, 5, 3);
+  if (extra) extra(ctx, hx, hy, shY, hipY);
+  // 앞팔과 주먹
+  limb(sh, frontHand, c, lw, false);
+  ctx.fillStyle = c; ctx.strokeStyle = d; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(frontHand.x, frontHand.y, o.fistR, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  if (p.guard) {
+    ctx.shadowBlur = 0; ctx.strokeStyle = 'rgba(160,215,255,.7)'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(22, shY + 32, 48, -1.1, 1.1); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawKai(ctx, p, c) {
+  drawBody(ctx, p, { color: c.color, dark: c.dark, torsoW: 26, headR: 14, limbW: 9, fistR: 6, seg: 26 }, (ctx, hx, hy) => {
+    const wv = Math.sin(p.anim * 0.2) * 4;
+    ctx.strokeStyle = '#e8343c'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(hx - 14, hy - 4); ctx.lineTo(hx + 14, hy - 4); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(hx - 13, hy - 4); ctx.quadraticCurveTo(hx - 26, hy - 8 + wv, hx - 36, hy + 2 - wv); ctx.stroke();
+  });
+}
+function drawMira(ctx, p, c) {
+  drawBody(ctx, p, { color: c.color, dark: c.dark, torsoW: 20, headR: 13, limbW: 7, fistR: 5, seg: 27 }, (ctx, hx, hy, shY) => {
+    const wv = Math.sin(p.anim * 0.25) * 3;
+    ctx.fillStyle = c.dark;
+    [[-13, -6, 7], [-21, 0 + wv, 6], [-27, 8 + wv * 1.5, 5]].forEach(([x, y, r]) => { ctx.beginPath(); ctx.arc(hx + x, hy + y, r, 0, Math.PI * 2); ctx.fill(); });
+    ctx.fillStyle = '#fff'; ctx.fillRect(-11, shY + 2, 22, 5); // 목도리
+  });
+}
+function drawGor(ctx, p, c) {
+  drawBody(ctx, p, { color: c.color, dark: c.dark, torsoW: 40, headR: 12, limbW: 12, fistR: 10, seg: 25 }, (ctx, hx, hy, shY, hipY) => {
+    ctx.fillStyle = c.dark;
+    ctx.beginPath(); ctx.arc(-15, shY + 4, 11, 0, Math.PI * 2); ctx.arc(17, shY + 4, 11, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ffd23f'; ctx.fillRect(-20, hipY - 2, 40, 6); // 금색 벨트
+    ctx.fillStyle = c.dark; ctx.fillRect(hx - 9, hy + 4, 16, 6); // 수염
+  });
+}
+
+function drawFighter(ctx, f) {
+  ctx.save(); ctx.translate(f.x, f.y); ctx.scale(f.facing * f.scale, f.scale);
+  if (f.state === 'dash' || f.state === 'backstep') ctx.globalAlpha = 0.7;
+  else if (f.inv > 0 && (f.anim >> 2) % 2) ctx.globalAlpha = 0.45;
+  const berserk = f.aug.berserk && f.hp < f.maxHp * 0.3 && f.state !== 'ko';
+  if (f.isBoss) { ctx.shadowColor = '#ff3355'; ctx.shadowBlur = 20; }
+  if (berserk) { ctx.shadowColor = '#ff2020'; ctx.shadowBlur = 24; }
+  if (f.boostT > 0) { ctx.shadowColor = '#ffe14a'; ctx.shadowBlur = 24; }
+  const white = f.flash > 0;
+  f.def.draw(ctx, fighterPose(f), { color: white ? '#ffffff' : f.color, dark: white ? '#dddddd' : f.dark });
+  ctx.restore();
+}
+function drawPreview(ctx, def, x, y, scale, t, color, dark) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(scale, scale);
+  def.draw(ctx, { crouch: 0, lean: 0, arm: null, leg: null, guard: false, air: false, lying: false, walk: null, glow: false, anim: t },
+    { color: color || def.color, dark: dark || def.dark });
+  ctx.restore();
+}
+
+// ---------- 스테이지 ----------
+const BGS = [
+  { name: '해질녘 옥상', sky: ['#2a1748', '#e9775b'], sun: '#ffd27a', far: '#4a2a5c', mid: '#2a1838', floor: '#2d2230', line: '#5a4060' },
+  { name: '푸른 밤 항구', sky: ['#06122a', '#24508a'], sun: '#e8f0ff', far: '#10264a', mid: '#0b1a34', floor: '#151d2b', line: '#2e3e5a' },
+  { name: '대나무 숲', sky: ['#0f2a1c', '#7fb889'], sun: '#f4ffd0', far: '#1f4a30', mid: '#163a25', floor: '#2a3322', line: '#4a5a3a' },
+  { name: '붉은 사막', sky: ['#4a1e0c', '#f0b066'], sun: '#fff0b0', far: '#7a3a18', mid: '#5a2a12', floor: '#6a4426', line: '#8a6040' },
+  { name: '네온 거리', sky: ['#0c0620', '#4a1470'], sun: '#ff6ad5', far: '#241040', mid: '#160a2c', floor: '#1a1226', line: '#ff4fd8' },
+  { name: '설원', sky: ['#2c3a5a', '#c6d8ee'], sun: '#ffffff', far: '#8aa0c0', mid: '#5a6e90', floor: '#d8e2ee', line: '#a8b8cc' },
+];
+class Stage {
+  constructor(n) {
+    this.n = n; this.boss = n % 3 === 0; const k = n - 1, b = this.boss;
+    this.hpMul = (1 + 0.12 * k) * (b ? 1.5 : 1);
+    this.atkMul = (0.8 + 0.08 * k) * (b ? 1.15 : 1);
+    this.ai = {
+      react: Math.max(6, 28 - 2.2 * k - (b ? 4 : 0)),
+      block: Math.min(0.75, 0.08 + 0.06 * k + (b ? 0.1 : 0)),
+      combo: Math.min(0.95, 0.2 + 0.08 * k),
+      aggr: Math.min(0.9, 0.28 + 0.06 * k + (b ? 0.08 : 0)),
+      dash: Math.min(0.5, 0.1 + 0.04 * k),
+    };
+    this.bg = BGS[k % BGS.length];
+    this.enemyDef = CHARS[Math.floor(Math.random() * CHARS.length)];
+  }
+  drawBackground(ctx) {
+    const b = this.bg;
+    const g = ctx.createLinearGradient(0, 0, 0, GROUND); g.addColorStop(0, b.sky[0]); g.addColorStop(1, b.sky[1]);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 0.85; ctx.fillStyle = b.sun; ctx.beginPath(); ctx.arc(W * 0.72, 150, 46, 0, Math.PI * 2); ctx.fill(); ctx.globalAlpha = 1;
+    let s = this.n * 7919 + 13; const R = () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+    ctx.fillStyle = b.far; ctx.beginPath(); ctx.moveTo(0, GROUND);
+    for (let x = 0; x <= W; x += 80) ctx.lineTo(x, GROUND - 120 - R() * 130);
+    ctx.lineTo(W, GROUND); ctx.fill();
+    ctx.fillStyle = b.mid;
+    for (let x = 0; x < W;) { const h = 40 + R() * 110, w = 40 + R() * 50; ctx.fillRect(x, GROUND - h, w, h); x += w + R() * 30; }
+    ctx.fillStyle = b.floor; ctx.fillRect(0, GROUND, W, H - GROUND);
+    ctx.strokeStyle = b.line; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, GROUND); ctx.lineTo(W, GROUND);
+    for (let i = -8; i <= 8; i++) { ctx.moveTo(W / 2 + i * 60, GROUND); ctx.lineTo(W / 2 + i * 160, H); }
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(0,0,0,.4)'; ctx.fillRect(0, 0, WALL_L, H); ctx.fillRect(WALL_R, 0, W - WALL_R, H);
+    if (this.boss) {
+      const v = ctx.createRadialGradient(W / 2, H / 2, 200, W / 2, H / 2, 620);
+      v.addColorStop(0, 'rgba(120,0,20,0)'); v.addColorStop(1, 'rgba(160,0,30,.45)');
+      ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+    }
+  }
+}
+
+// ---------- 증강 ----------
+const AUGMENTS = [
+  { id: 'hp', kind: '능력치', name: '강철 체력', desc: '최대 체력 +20%', icon: '♥', color: '#e5484d', stack: true,
+    apply: r => { const old = r.def.hp * r.hpMul; r.hpMul *= 1.2; r.hp += r.def.hp * r.hpMul - old; } },
+  { id: 'atk', kind: '능력치', name: '날카로운 주먹', desc: '공격력 +15%', icon: '⚔', color: '#f2994a', stack: true, apply: r => { r.atkMul *= 1.15; } },
+  { id: 'spd', kind: '능력치', name: '질풍', desc: '이동 속도 +10%', icon: '»', color: '#2fb380', stack: true, apply: r => { r.spdMul *= 1.1; } },
+  { id: 'meter', kind: '능력치', name: '투지', desc: '필살기 게이지 충전 +25%', icon: '⚡', color: '#d4a017', stack: true, apply: r => { r.meterMul *= 1.25; } },
+  { id: 'lifesteal', kind: '특수 능력', name: '흡혈', desc: '입힌 피해의 10%만큼 체력 회복', icon: '✚', color: '#b4235a' },
+  { id: 'dashBoost', kind: '특수 능력', name: '돌격 본능', desc: '대시 후 다음 공격 피해 2배', icon: '➤', color: '#3b82f6' },
+  { id: 'counter', kind: '특수 능력', name: '반격 태세', desc: '방어에 성공하면 자동으로 반격', icon: '◆', color: '#14a3b8' },
+  { id: 'berserk', kind: '특수 능력', name: '광전사', desc: '체력 30% 이하일 때 공격력 +40%', icon: '☠', color: '#9b1c1c' },
+  { id: 'doubleJump', kind: '특수 능력', name: '2단 점프', desc: '공중에서 K로 한 번 더 점프', icon: '⇈', color: '#7c5cff' },
+];
+const AUG_BY_ID = Object.fromEntries(AUGMENTS.map(a => [a.id, a]));
+class Augment {
+  static roll(run, n) {
+    const pool = AUGMENTS.filter(a => a.stack || !run.aug[a.id]);
+    for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+    return pool.slice(0, n);
+  }
+  static apply(run, a) {
+    run.counts[a.id] = (run.counts[a.id] || 0) + 1;
+    if (a.stack) a.apply(run); else run.aug[a.id] = true;
+  }
+}
+
+// ---------- 장면 ----------
+class Scene { constructor(g) { this.g = g; this.t = 0; } update() {} draw() {} }
+
+class LoadingScene extends Scene {
+  update() { this.t++; if (this.t > 105) this.g.go(new SelectScene(this.g)); }
+  draw(ctx) {
+    ctx.fillStyle = '#0b0d14'; ctx.fillRect(0, 0, W, H);
+    txt(ctx, '증강 아레나', W / 2, 190, 64, '#ffe066');
+    txt(ctx, 'SIDE VIEW FIGHTER', W / 2, 245, 18, '#9aa4c0', 'center', false);
+    const k = Math.min(1, this.t / 90), e = 1 - Math.pow(1 - k, 3);
+    ctx.fillStyle = '#1d2233'; rr(ctx, W / 2 - 220, 320, 440, 18, 9); ctx.fill();
+    ctx.fillStyle = '#ffd23f'; rr(ctx, W / 2 - 220, 320, Math.max(18, 440 * e), 18, 9); ctx.fill();
+    txt(ctx, `로딩 중... ${Math.round(e * 100)}%`, W / 2, 365, 16, '#cfd6ea', 'center', false);
+  }
+}
+
+class SelectScene extends Scene {
+  constructor(g) { super(g); this.idx = g.lastChar || 0; this.help = false; }
+  update() {
+    this.t++; const i = this.g.input;
+    if (i.tap('h')) { this.help = !this.help; Sound.select(); }
+    if (this.help) { if (i.tap('j')) this.help = false; return; }
+    if (i.tap('a')) { this.idx = (this.idx + CHARS.length - 1) % CHARS.length; Sound.select(); }
+    if (i.tap('d')) { this.idx = (this.idx + 1) % CHARS.length; Sound.select(); }
+    if (i.tap('j')) { Sound.confirm(); this.g.startRun(this.idx); }
+  }
+  draw(ctx) {
+    const bg = ctx.createLinearGradient(0, 0, 0, H); bg.addColorStop(0, '#161a2b'); bg.addColorStop(1, '#0a0b12');
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    txt(ctx, '캐릭터 선택', W / 2, 52, 36, '#fff');
+    CHARS.forEach((c, n) => {
+      const sel = n === this.idx, cx = 200 + n * 280, cy = 270, w = 240, h = 360;
+      const lift = sel ? Math.sin(this.t * 0.1) * 4 - 8 : 0;
+      ctx.save(); ctx.translate(0, lift);
+      ctx.fillStyle = sel ? '#262c46' : '#1a1e30'; rr(ctx, cx - w / 2, cy - h / 2, w, h, 16); ctx.fill();
+      ctx.lineWidth = sel ? 4 : 2; ctx.strokeStyle = sel ? c.color : '#33395a'; ctx.stroke();
+      drawPreview(ctx, c, cx, cy + 6, 1.1, this.t + n * 30);
+      txt(ctx, c.name, cx, cy + 36, 26, c.color);
+      txt(ctx, c.type, cx, cy + 60, 14, '#c9cfe4', 'center', false);
+      const bars = [['체력', c.hp / 130], ['속도', c.speed / 6], ['공격력', c.power / 1.4]];
+      bars.forEach(([lab, v], b) => {
+        const y = cy + 84 + b * 20;
+        txt(ctx, lab, cx - 98, y, 12, '#aab', 'left', false);
+        ctx.fillStyle = '#0d0f19'; ctx.fillRect(cx - 50, y - 5, 140, 10);
+        ctx.fillStyle = c.color; ctx.fillRect(cx - 50, y - 5, 140 * v, 10);
+      });
+      txt(ctx, '필살기: ' + c.specialName, cx, cy + 150, 13, '#ffe066', 'center', false);
+      txt(ctx, c.desc, cx, cy + 168, 12, '#c9cfe4', 'center', false);
+      ctx.restore();
+    });
+    txt(ctx, 'A / D 선택   ·   J 결정   ·   H 조작법', W / 2, H - 46, 18, '#e8ecf8');
+    txt(ctx, `최고 도달 스테이지: ${this.g.best || '-'}`, W / 2, H - 20, 13, '#8a93b0', 'center', false);
+    if (this.help) drawHelp(ctx);
+  }
+}
+function drawHelp(ctx) {
+  ctx.fillStyle = 'rgba(5,6,12,.97)'; ctx.fillRect(0, 0, W, H);
+  txt(ctx, '조작법', W / 2, 50, 32, '#ffe066');
+  const rows = [
+    ['A / D', '좌우 이동'], ['K', '점프 (길게 누르면 높게, 짧게 누르면 낮게)'], ['S', '방어 (피해 80% 감소)'],
+    ['J', '일반 공격 · 리듬에 맞춰 누르면 콤보 (미라는 4단)'], ['U', '원거리 공격 (화면에 1발씩)'], ['L', '짧은 대시 (무적 시간)  ·  뒤 + L 백스텝'],
+    ['I', '필살기 (게이지 1칸)'], ['S + J / S + U', '하단 공격 / 바닥을 스치는 탄 (둘 다 넘어뜨림)'], ['S + I', '궁극기 (게이지 2칸)'],
+    ['W + J / W + U', '상단 공격 / 위쪽 대각선 탄 (대공)'], ['W + I', '특수 필살기 · 에너지탄 (게이지 1칸, U 탄을 뚫음)'],
+    ['점프 중 J / U', '공중 공격 / 아래쪽 대각선 탄'], ['앞 + J', '돌진 찌르기'], ['대시 중 J', '대시 공격'], ['P', '일시정지'],
+  ];
+  rows.forEach(([k, d], n) => {
+    const y = 100 + n * 26;
+    txt(ctx, k, W / 2 - 40, y, 16, '#9fd3ff', 'right', false);
+    txt(ctx, d, W / 2 - 10, y, 16, '#e8ecf8', 'left', false);
+  });
+  txt(ctx, 'J 또는 H로 닫기', W / 2, H - 30, 15, '#8a93b0', 'center', false);
+}
+
+class BattleScene extends Scene {
+  constructor(g) {
+    super(g); const run = g.run;
+    this.stage = new Stage(run.stage); const st = this.stage, ed = st.enemyDef, same = ed === run.def;
+    this.player = new Fighter(run.def, 260, 1, { hpMul: run.hpMul, hp: run.hp, atkMul: run.atkMul, spdMul: run.spdMul,
+      meterMul: run.meterMul, aug: run.aug, meter: run.meter });
+    this.npc = new Fighter(ed, 700, -1, { hpMul: st.hpMul, atkMul: st.atkMul, scale: st.boss ? 1.22 : 1, boss: st.boss,
+      name: (st.boss ? '보스 ' : '') + ed.name, color: same || st.boss ? ed.alt : ed.color, dark: same || st.boss ? ed.altDark : ed.dark });
+    this.pc = new PlayerController(g.input); this.ai = new AI(this.npc, this.player, st.ai, this);
+    this.phase = 'intro'; this.projectiles = []; this.parts = []; this.texts = [];
+    this.shake = 0; this.shakeDir = 0; this.flashT = 0; this.hitstop = 0; this.superT = 0; this.superMax = 1; this.superBy = null; this.superName = ''; this.superUlt = false;
+    this.paused = false; this.comboText = null; this.winner = null; this.slowTick = 0;
+    g.saveBest(run.stage);
+  }
+  update() {
+    const i = this.g.input;
+    if (i.tap('p') && this.phase === 'fight') { this.paused = !this.paused; i.clear(); }
+    i.paused = this.paused || this.superT > 0 || this.hitstop > 0;
+    if (this.paused) return;
+    this.t++; this.updateFx();
+    if (this.superT > 0) { this.superT--; return; }
+    if (this.hitstop > 0) { this.hitstop--; return; }
+    if (this.phase === 'intro') { if (this.t > 110) { this.phase = 'fight'; this.t = 0; } this.step(NO_INPUT, NO_INPUT); return; }
+    if (this.phase === 'ko') {
+      this.slowTick++;
+      if (this.t < 60 && this.slowTick % 2) return; // KO 직후 슬로모션
+      this.step(NO_INPUT, NO_INPUT);
+      if (this.t > 170) this.finish();
+      return;
+    }
+    this.step(this.pc.read(), this.ai.read());
+  }
+  step(pi, ni) {
+    const P = this.player, N = this.npc;
+    P.update(pi, N, this); N.update(ni, P, this);
+    this.separate();
+    this.checkHit(P, N); this.checkHit(N, P);
+    this.updateProjectiles();
+    for (const f of [P, N]) f.shownHp = f.shownHp > f.hp ? Math.max(f.hp, f.shownHp - 0.35) : f.hp;
+    for (const f of [P, N]) { const o = f === P ? N : P; if (o.state !== 'hit') f.combo = 0; }
+  }
+  separate() {
+    const a = this.player, b = this.npc;
+    if (a.state === 'ko' || b.state === 'ko') return;
+    const minD = 25 * (a.scale + b.scale), dx = b.x - a.x;
+    if (Math.abs(dx) < minD && Math.abs(a.y - b.y) < 110 * Math.max(a.scale, b.scale)) {
+      const sgn = dx === 0 ? (a.facing || 1) : Math.sign(dx), push = (minD - Math.abs(dx)) / 2;
+      a.x -= sgn * push; b.x += sgn * push;
+      a.x = clamp(a.x, WALL_L + 20, WALL_R - 20); b.x = clamp(b.x, WALL_L + 20, WALL_R - 20);
+      if (Math.abs(b.x - a.x) < minD - 0.5) {
+        if (a.x <= WALL_L + 20 || a.x >= WALL_R - 20) b.x = a.x + sgn * minD; else a.x = b.x - sgn * minD;
+      }
+    }
+  }
+  checkHit(a, d) {
+    if (!a.active() || a.hitDone) return;
+    const hb = a.hitbox();
+    if (hb && overlap(hb, d.hurtbox()) && this.resolveHit(a, d, a.move, a.facing, a.x)) a.hitDone = true;
+  }
+  resolveHit(a, d, m, dir, srcX) {
+    if (d.inv > 0 || d.state === 'knock' || d.state === 'ko') return false;
+    let dmg = m.dmg * a.def.power * a.atkMul;
+    if (a.aug.berserk && a.hp < a.maxHp * 0.3) dmg *= 1.4;
+    if (a.boosted && !m.isProj) dmg *= 2;
+    const fin = m.rehit && a.t >= m.s + m.a - m.rehit;
+    const hy = d.y - 80 * d.scale, hx = d.x - dir * 14;
+    if (d.isGuarding(srcX)) {
+      dmg *= 0.2; d.hp = Math.max(1, d.hp - dmg);
+      d.state = 'guardstun'; d.stun = Math.round(m.hs * 0.6); d.vx = dir * (m.kbx * 0.5 + 2.5);
+      if (!m.cost) this.gain(a, dmg * 2 * a.meterMul);
+      this.gain(d, dmg * 3 * d.meterMul);
+      this.impact(hx, hy, '#9fd3ff', 3, dir); Sound.block(); this.hitstop = 4;
+      this.shake = Math.max(this.shake, 2); this.shakeDir = dir;
+      if (d.aug.counter && !m.isProj && Math.abs(a.x - d.x) < 170 && a.state !== 'ko') {
+        const cd = 7 * d.def.power * d.atkMul;
+        a.hp -= cd; a.state = 'hit'; a.stun = 20; a.move = null; a.vx = -dir * 6; a.vy = -3; a.grounded = false; a.kdOnLand = false; a.flash = 6;
+        this.text(a.x, a.y - 150 * a.scale, '반격!', '#7fe7ff', 22); this.spark(a.x, a.y - 80, d.color, 12);
+        if (a.hp <= 0) { a.hp = 0; this.ko(a, d, -dir); }
+      }
+      return true;
+    }
+    a.combo = d.state === 'hit' ? a.combo + 1 : 1;
+    const wasGrounded = d.grounded;
+    d.hp -= dmg; d.move = null; d.flash = 5; d.chainGrace = 0; d.jumpHeld = false;
+    const launch = fin && m.finalLaunch;
+    const kbx = launch ? 9 : m.kbx; let kby = launch ? -11 : m.kby;
+    if (!wasGrounded && kby > -4 && kby <= 0) kby = -4;
+    if (m.kd && kby >= 0 && wasGrounded) { d.state = 'knock'; d.t = 0; d.vx = dir * kbx; d.vy = 0; }
+    else {
+      d.state = 'hit'; d.stun = m.hs; d.vx = dir * kbx; d.vy = kby;
+      if (kby < 0 || !wasGrounded) { d.grounded = false; d.kdOnLand = !!(m.kd || launch || !wasGrounded); }
+      else d.kdOnLand = false;
+    }
+    if (a.aug.lifesteal) a.hp = Math.min(a.maxHp, a.hp + dmg * 0.1);
+    if (!m.cost) this.gain(a, dmg * 2.2 * a.meterMul);
+    this.gain(d, dmg * 1.4 * d.meterMul);
+    this.hitstop = m.cost ? 3 : clamp(Math.round(3 + dmg / 2), 4, 10);
+    this.shake = Math.max(this.shake, (m.shake || 0) + dmg * 0.6); this.shakeDir = dir;
+    this.impact(hx, hy, a.boosted ? '#ffe14a' : '#fff3c4', dmg, dir);
+    if (dmg >= 8 || launch || m.kd) this.flashT = Math.max(this.flashT, 5); // 큰 타격은 화면이 순간 번쩍임
+    Sound.hit(dmg);
+    if (a.combo >= 2) this.comboText = { who: a, n: a.combo, t: 70 };
+    if (d.hp <= 0) { d.hp = 0; this.ko(d, a, dir); }
+    return true;
+  }
+  ko(d, a, dir) {
+    if (this.phase === 'ko') return;
+    d.state = 'ko'; d.vx = dir * 7; d.vy = -10; d.grounded = false; d.move = null;
+    this.phase = 'ko'; this.t = 0; this.winner = a; this.shake = 16; this.shakeDir = dir; this.hitstop = 12; this.flashT = 9; Sound.ko();
+    this.impact(d.x, d.y - 80 * d.scale, '#ffffff', 22, dir);
+  }
+  // 게이지가 한 칸 찰 때마다 플레이어에게 알림음
+  gain(f, amt) {
+    const before = Math.floor(f.meter / 100);
+    f.meter = Math.min(200, f.meter + amt);
+    if (f === this.player && Math.floor(f.meter / 100) > before) Sound.ding();
+  }
+  finish() {
+    const g = this.g;
+    if (this.winner === this.player) {
+      g.run.hp = this.player.hp; g.run.meter = this.player.meter;
+      g.go(new AugmentScene(g));
+    } else g.go(new GameOverScene(g));
+  }
+  startSuper(f, m) {
+    this.superUlt = !!m.ult; this.superBy = f;
+    this.superT = this.superMax = m.ult ? 55 : 26;
+    this.superName = m.ult ? f.def.ultName : m.id === 'orb' ? f.def.orbName : f.def.specialName;
+    Sound.superStart(m.ult);
+  }
+  canShoot(f) { return !this.projectiles.some(p => p.owner === f && p.small); }
+  spawnProjectile(f, pr) {
+    const p = { owner: f, x: f.x + f.facing * 50 * f.scale, y: f.y + (pr.y !== undefined ? pr.y : -85) * f.scale,
+      vx: f.facing * pr.speed, vy: pr.vy || 0, r: pr.r * f.scale, life: pr.life || 110, color: f.color,
+      small: !!pr.small, power: pr.small ? 1 : 2, m: { ...pr.hit, isProj: true } };
+    this.projectiles.push(p);
+    this.spark(p.x, p.y, f.color, p.small ? 5 : 10);
+    if (p.small) Sound.shot(); else Sound.orb();
+  }
+  updateProjectiles() {
+    for (const p of this.projectiles) {
+      p.x += p.vx; p.y += p.vy; p.life--;
+      if (p.y > GROUND - 4) { p.life = 0; this.spark(p.x, GROUND - 4, p.color, 8); continue; }
+      const tgt = p.owner === this.player ? this.npc : this.player;
+      const hb = { x: p.x - p.r, y: p.y - p.r, w: p.r * 2, h: p.r * 2 };
+      if (overlap(hb, tgt.hurtbox()) && this.resolveHit(p.owner, tgt, p.m, Math.sign(p.vx), p.x)) { p.life = 0; this.spark(p.x, p.y, p.color, 18); }
+      if (p.x < WALL_L || p.x > WALL_R) { p.life = 0; this.spark(p.x, p.y, p.color, 10); }
+      if (Math.random() < 0.7) this.parts.push({ x: p.x, y: p.y + rand(-6, 6), vx: -p.vx * 0.2, vy: rand(-1, 1), life: 18, max: 18, color: p.color, size: rand(3, 6) });
+    }
+    for (const a of this.projectiles) for (const b of this.projectiles) {
+      if (a !== b && a.owner !== b.owner && a.life > 0 && b.life > 0 && Math.abs(a.x - b.x) < a.r + b.r && Math.abs(a.y - b.y) < a.r + b.r) {
+        // 같은 크기면 둘 다 사라지고, 에너지탄(큰 탄)은 작은 탄을 뚫고 지나감
+        if (a.power === b.power) a.life = b.life = 0; else if (a.power < b.power) a.life = 0; else b.life = 0;
+        this.spark((a.x + b.x) / 2, (a.y + b.y) / 2, '#fff', 16); this.shake = Math.max(this.shake, 4);
+      }
+    }
+    this.projectiles = this.projectiles.filter(p => p.life > 0);
+  }
+  // 이펙트
+  spark(x, y, color, n) {
+    for (let i = 0; i < n; i++) { const a = rand(0, Math.PI * 2), s = rand(2, 7);
+      this.parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(12, 24), max: 24, color, size: rand(2, 5) }); }
+  }
+  // 타격 이펙트: 충격 고리 + 맞은 방향으로 튀는 불꽃 줄기 + 회전하며 떨어지는 파편 (power가 클수록 많고 큼)
+  impact(x, y, color, power, dir) {
+    const base = dir > 0 ? 0 : Math.PI;
+    this.parts.push({ kind: 'ring', x, y, r: 6, vr: 3 + power * 0.3, life: 12, max: 12, color: '#ffffff', size: 3 + power * 0.15 });
+    for (let i = 0, n = Math.round(6 + power * 1.2); i < n; i++) {
+      const a = base + rand(-1.2, 1.2), s = rand(4, 9 + power * 0.4);
+      this.parts.push({ kind: 'streak', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 1, life: rand(8, 16), max: 16, color, size: rand(2, 3.5) });
+    }
+    for (let i = 0, n = Math.round(3 + power * 0.6); i < n; i++) {
+      const a = base + rand(-1.5, 1.5), s = rand(2, 6);
+      this.parts.push({ kind: 'shard', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 2.5, rot: rand(0, 6.28), vrot: rand(-0.4, 0.4),
+        life: rand(20, 34), max: 34, color: i % 2 ? color : '#ffffff', size: rand(4, 8), grav: 0.35 });
+    }
+  }
+  puff(x, y, color) { this.spark(x, y, color, 20); }
+  dust(x, y) { for (let i = 0; i < 6; i++) this.parts.push({ x: x + rand(-14, 14), y: y - 2, vx: rand(-2, 2), vy: rand(-1.5, -0.2), life: 20, max: 20, color: 'rgba(220,220,220,.8)', size: rand(3, 6) }); }
+  text(x, y, s, color, size) { this.texts.push({ x, y, s, color, size, life: 50 }); }
+  updateFx() {
+    for (const p of this.parts) {
+      p.life--;
+      if (p.kind === 'ring') { p.r += p.vr; p.vr *= 0.85; continue; }
+      p.x += p.vx; p.y += p.vy; p.vx *= 0.92; p.vy = p.vy * 0.92 + 0.12 + (p.grav || 0);
+      if (p.kind === 'shard') { p.rot += p.vrot; if (p.y > GROUND) { p.y = GROUND; p.vy *= -0.3; p.vx *= 0.6; } }
+    }
+    this.parts = this.parts.filter(p => p.life > 0);
+    for (const t of this.texts) { t.y -= 0.8; t.life--; }
+    this.texts = this.texts.filter(t => t.life > 0);
+    this.shake *= 0.86; if (this.shake < 0.3) this.shake = 0;
+    if (this.flashT > 0) this.flashT--;
+    if (this.comboText && --this.comboText.t <= 0) this.comboText = null;
+  }
+  drawMoveFx(ctx, f) {
+    if (f.state !== 'attack' || !f.move) return;
+    const m = f.move, t = f.t;
+    if (m.ult && t >= m.s && t < m.s + m.a) {
+      const hb = f.hitbox(), x0 = f.facing > 0 ? f.x + 20 * f.scale : WALL_L, x1 = f.facing > 0 ? WALL_R : f.x - 20 * f.scale;
+      ctx.save(); ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.55; ctx.fillStyle = f.color; ctx.fillRect(x0, hb.y - 8 + rand(-3, 3), x1 - x0, hb.h + 16);
+      ctx.globalAlpha = 0.9; ctx.fillStyle = '#ffffff'; ctx.fillRect(x0, hb.y + hb.h * 0.3 + rand(-2, 2), x1 - x0, hb.h * 0.4);
+      ctx.restore();
+    }
+    if (m.wave && t >= m.s - 2 && t < m.s + m.a + 12) {
+      const k = clamp((t - m.s + 2) / (m.a + 6), 0, 1), len = 420 * f.scale * k;
+      ctx.save(); ctx.globalAlpha = 1 - Math.max(0, (t - m.s - m.a) / 12);
+      for (let d = 30; d < len; d += 34) {
+        const x = f.x + f.facing * d, h = 26 + Math.sin(d * 0.3) * 14 + 30 * (1 - d / 460);
+        ctx.fillStyle = f.dark; ctx.beginPath(); ctx.moveTo(x - 16, GROUND); ctx.lineTo(x, GROUND - h); ctx.lineTo(x + 16, GROUND); ctx.fill();
+        ctx.fillStyle = f.color; ctx.beginPath(); ctx.moveTo(x - 8, GROUND); ctx.lineTo(x, GROUND - h * 0.6); ctx.lineTo(x + 8, GROUND); ctx.fill();
+      }
+      ctx.restore();
+    }
+    if ((m.id === 'rush' || m.id === 'teleport' || m.id === 'dashAtk' || m.id === 'thrust') && t >= m.s && t < m.s + m.a) {
+      ctx.save(); ctx.strokeStyle = f.color; ctx.globalAlpha = 0.6; ctx.lineWidth = 3;
+      for (let i = 0; i < 4; i++) { const y = f.y - rand(30, 120) * f.scale; ctx.beginPath(); ctx.moveTo(f.x - f.facing * rand(20, 40), y); ctx.lineTo(f.x - f.facing * rand(80, 140), y); ctx.stroke(); }
+      ctx.restore();
+    }
+  }
+  draw(ctx) {
+    const P = this.player, N = this.npc;
+    ctx.save();
+    // 화면 흔들림: 맞은 방향으로 조금 더 밀리듯 흔들림
+    if (this.shake > 0) ctx.translate((rand(-1, 1) + this.shakeDir * 0.5) * this.shake, rand(-1, 1) * this.shake * 0.7);
+    this.stage.drawBackground(ctx);
+    for (const f of [P, N]) {
+      const k = clamp(1 - (GROUND - f.y) / 300, 0.3, 1);
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(f.x, GROUND + 4, 34 * f.scale * k, 7 * k, 0, 0, Math.PI * 2); ctx.fill();
+    }
+    // 필살기가 나가는 동안 배경을 어둡게
+    const sup = [P, N].find(f => f.state === 'attack' && f.move && f.move.super && f.t < f.move.s + f.move.a + 8);
+    if (sup) { ctx.fillStyle = `rgba(0,0,0,${sup.move.ult ? 0.55 : 0.4})`; ctx.fillRect(-30, -30, W + 60, H + 60); }
+    const order = P.state === 'attack' ? [N, P] : [P, N];
+    for (const f of order) this.drawMoveFx(ctx, f);
+    for (const f of order) drawFighter(ctx, f);
+    for (const p of this.projectiles) {
+      ctx.save(); ctx.shadowColor = p.color; ctx.shadowBlur = 24; ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.5, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    }
+    ctx.lineCap = 'round';
+    for (const p of this.parts) {
+      const al = Math.max(0, p.life / p.max); ctx.globalAlpha = al;
+      if (p.kind === 'ring') {
+        ctx.strokeStyle = p.color; ctx.lineWidth = p.size * al + 1; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.stroke();
+      } else if (p.kind === 'streak') {
+        ctx.strokeStyle = p.color; ctx.lineWidth = p.size; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 2.2, p.y - p.vy * 2.2); ctx.stroke();
+      } else if (p.kind === 'shard') {
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.fillStyle = p.color;
+        ctx.beginPath(); ctx.moveTo(0, -p.size); ctx.lineTo(p.size * 0.6, p.size * 0.5); ctx.lineTo(-p.size * 0.6, p.size * 0.5); ctx.closePath(); ctx.fill();
+        ctx.restore();
+      } else { ctx.fillStyle = p.color; ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size); }
+    }
+    ctx.globalAlpha = 1;
+    for (const t of this.texts) { ctx.globalAlpha = Math.min(1, t.life / 20); txt(ctx, t.s, t.x, t.y, t.size, t.color); }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (this.flashT > 0) { ctx.fillStyle = `rgba(255,255,255,${0.05 * this.flashT})`; ctx.fillRect(0, 0, W, H); }
+    if (this.superT > 0) this.drawSuper(ctx);
+    this.drawHUD(ctx);
+    if (this.phase === 'intro') {
+      const s = this.t < 55 ? (this.stage.boss ? `BOSS STAGE ${this.stage.n}` : `STAGE ${this.stage.n}`) : 'ROUND START';
+      const k = (this.t % 55) / 55, a = this.t < 55 ? Math.min(1, k * 3) : Math.max(0, 1 - Math.max(0, k - 0.6) * 2.5);
+      ctx.globalAlpha = a; txt(ctx, s, W / 2, H / 2 - 30, this.t < 55 ? 52 : 64, this.stage.boss && this.t < 55 ? '#ff5470' : '#ffe066'); ctx.globalAlpha = 1;
+    }
+    if (this.phase === 'ko') {
+      txt(ctx, 'K.O.', W / 2, H / 2 - 40, 96, '#ff4d4d');
+      if (this.t > 70) txt(ctx, this.winner === P ? '승리!' : '패배...', W / 2, H / 2 + 40, 40, this.winner === P ? '#ffe066' : '#c0c6da');
+    }
+    if (this.paused) {
+      ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 0, W, H);
+      txt(ctx, '일시정지', W / 2, H / 2 - 20, 48, '#fff'); txt(ctx, 'P를 누르면 계속합니다', W / 2, H / 2 + 30, 18, '#cfd6ea', 'center', false);
+    }
+  }
+  drawSuper(ctx) {
+    const f = this.superBy, k = 1 - this.superT / this.superMax, ult = this.superUlt;
+    // 1) 화면 암전 (점점 더 어두워짐)
+    ctx.fillStyle = `rgba(0,0,0,${0.45 + 0.3 * Math.min(1, k * 5)})`; ctx.fillRect(0, 0, W, H);
+    // 2) 시전자를 향해 모이는 집중선
+    const cx = f.x, cy = f.y - 80 * f.scale;
+    ctx.save(); ctx.strokeStyle = ult ? 'rgba(255,230,120,.28)' : 'rgba(255,255,255,.22)'; ctx.lineWidth = 2;
+    for (let i = 0; i < 40; i++) {
+      const a = i / 40 * Math.PI * 2 + this.t * 0.015, r0 = 80 + ((i * 37 + this.t * 11) % 70);
+      ctx.beginPath(); ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * 1300, cy + Math.sin(a) * 1300); ctx.stroke();
+    }
+    ctx.restore();
+    // 3) 비스듬한 컷인 띠 + 캐릭터 클로즈업
+    const y = H * 0.42, bandH = ult ? 130 : 100, open = Math.min(1, k * 6), slide = 1 - Math.min(1, k * 4);
+    ctx.save(); ctx.translate(W / 2, y); ctx.rotate(-0.07 * f.facing);
+    const bh = bandH * open;
+    ctx.globalAlpha = 0.92; ctx.fillStyle = f.color; ctx.fillRect(-W, -bh / 2, W * 2, bh); ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(255,255,255,.16)';
+    for (let i = 0; i < 16; i++) ctx.fillRect(((i * 120 - this.t * 22 * f.facing) % (W * 2 + 120) + W * 2 + 120) % (W * 2 + 120) - W - 120, -bh / 2, 40, bh);
+    ctx.fillStyle = '#fff'; ctx.fillRect(-W, -bh / 2 - 3, W * 2, 3); ctx.fillRect(-W, bh / 2, W * 2, 3);
+    ctx.beginPath(); ctx.rect(-W, -bh / 2, W * 2, bh); ctx.clip();
+    const px = -f.facing * (W / 2 - 150) - f.facing * slide * 260;
+    ctx.save(); ctx.translate(px, 300); ctx.scale(f.facing, 1); // 얼굴이 띠 가운데 오도록
+    drawPreview(ctx, f.def, 0, 0, 2.7, this.t, f.color, f.dark); ctx.restore();
+    ctx.restore();
+    // 4) 기술 이름
+    const tx = W / 2 + f.facing * 70 + f.facing * slide * 500;
+    txt(ctx, ult ? '궁 극 기' : '필 살 기', tx, y - bandH / 2 - 22, ult ? 24 : 20, '#ffe066');
+    txt(ctx, this.superName, tx, y, ult ? 58 : 50, '#ffffff');
+    // 5) 시전자는 어둠 위에 빛나게
+    drawFighter(ctx, f);
+    // 6) 연출 시작·끝의 흰 번쩍임
+    if (k < 0.15) { ctx.fillStyle = `rgba(255,255,255,${0.6 * (1 - k / 0.15)})`; ctx.fillRect(0, 0, W, H); }
+    if (this.superT <= 3) { ctx.fillStyle = `rgba(255,255,255,${0.15 * this.superT})`; ctx.fillRect(0, 0, W, H); }
+  }
+  drawHUD(ctx) {
+    const P = this.player, N = this.npc, run = this.g.run;
+    hpBar(ctx, 24, 22, 370, 22, P.hp / P.maxHp, P.shownHp / P.maxHp, false);
+    hpBar(ctx, W - 394, 22, 370, 22, N.hp / N.maxHp, N.shownHp / N.maxHp, true);
+    txt(ctx, `${Math.ceil(P.hp)} / ${Math.round(P.maxHp)}`, 388, 33, 12, '#fff', 'right');
+    txt(ctx, `${Math.ceil(N.hp)} / ${Math.round(N.maxHp)}`, W - 388, 33, 12, '#fff', 'left');
+    txt(ctx, `${P.name} · ${P.def.type}`, 26, 58, 15, P.color, 'left');
+    txt(ctx, N.name, W - 26, 58, 15, N.isBoss ? '#ff7088' : N.color, 'right');
+    meterBar(ctx, 24, 72, 220, P.meter, false);
+    meterBar(ctx, W - 244, 72, 220, N.meter, true);
+    txt(ctx, `STAGE ${this.stage.n}`, W / 2, 30, 24, '#ffe066');
+    txt(ctx, this.stage.bg.name, W / 2, 54, 13, '#e3e7f3');
+    if (this.stage.boss) txt(ctx, 'BOSS', W / 2, 74, 15, '#ff5470');
+    let ix = 24;
+    for (const id in run.counts) {
+      const a = AUG_BY_ID[id];
+      ctx.fillStyle = a.color; rr(ctx, ix, 92, 28, 28, 6); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.lineWidth = 1.5; ctx.stroke();
+      txt(ctx, a.icon, ix + 14, 106, 15, '#fff', 'center', false);
+      if (run.counts[id] > 1) txt(ctx, 'x' + run.counts[id], ix + 26, 118, 10, '#fff');
+      ix += 33;
+    }
+    if (this.comboText) {
+      const c = this.comboText, left = c.who === P;
+      ctx.globalAlpha = Math.min(1, c.t / 20);
+      txt(ctx, `${c.n} HIT!`, left ? 120 : W - 120, 160, 30, '#ffd23f');
+      ctx.globalAlpha = 1;
+    }
+    txt(ctx, 'A/D 이동 · K 점프 · S 방어 · J 공격 · U 원거리 · L 대시 · I 필살기 · W/S+공격 = 상단/하단 · P 일시정지',
+      W / 2, H - 14, 12, 'rgba(255,255,255,.6)', 'center', false);
+  }
+}
+function hpBar(ctx, x, y, w, h, ratio, shown, right) {
+  ratio = clamp(ratio, 0, 1); shown = clamp(shown, 0, 1);
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(x - 3, y - 3, w + 6, h + 6);
+  ctx.fillStyle = '#3a1010'; ctx.fillRect(x, y, w, h);
+  const sw = w * shown, rw = w * ratio;
+  ctx.fillStyle = '#ff4040'; ctx.fillRect(right ? x + w - sw : x, y, sw, h);
+  const g = ctx.createLinearGradient(0, y, 0, y + h);
+  if (ratio > 0.3) { g.addColorStop(0, '#a8ff80'); g.addColorStop(1, '#2fae3a'); } else { g.addColorStop(0, '#ffd27a'); g.addColorStop(1, '#e0761a'); }
+  ctx.fillStyle = g; ctx.fillRect(right ? x + w - rw : x, y, rw, h);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(x, y, w, h);
+}
+function meterBar(ctx, x, y, w, v, right) {
+  const sw = (w - 6) / 2;
+  for (let i = 0; i < 2; i++) {
+    const sx = right ? x + w - (i + 1) * sw - i * 6 : x + i * (sw + 6);
+    const k = clamp((v - 100 * i) / 100, 0, 1);
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(sx, y, sw, 10);
+    ctx.fillStyle = k >= 1 ? (Math.floor(Date.now() / 150) % 2 ? '#fff3a0' : '#ffd23f') : '#b07d16';
+    ctx.fillRect(right ? sx + sw * (1 - k) : sx, y, sw * k, 10);
+    ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = 1; ctx.strokeRect(sx, y, sw, 10);
+  }
+}
+
+class AugmentScene extends Scene {
+  constructor(g) { super(g); this.opts = Augment.roll(g.run, 3); this.idx = 1; }
+  update() {
+    this.t++; const i = this.g.input; if (this.t < 30) { i.clear(); return; }
+    if (i.tap('a')) { this.idx = (this.idx + 2) % 3; Sound.select(); }
+    if (i.tap('d')) { this.idx = (this.idx + 1) % 3; Sound.select(); }
+    if (i.tap('j')) { Sound.confirm(); Augment.apply(this.g.run, this.opts[this.idx]); this.g.nextStage(); }
+  }
+  draw(ctx) {
+    const bg = ctx.createLinearGradient(0, 0, 0, H); bg.addColorStop(0, '#1b1530'); bg.addColorStop(1, '#09080f');
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    const run = this.g.run;
+    txt(ctx, `STAGE ${run.stage} 클리어!`, W / 2, 50, 22, '#ffe066');
+    txt(ctx, '증강 선택', W / 2, 92, 38, '#fff');
+    this.opts.forEach((a, n) => {
+      const sel = n === this.idx, cx = 210 + n * 270, cy = 290, w = 230, h = 280;
+      const s = sel ? 1.06 : 1;
+      ctx.save(); ctx.translate(cx, cy); ctx.scale(s, s);
+      ctx.fillStyle = sel ? '#2a2445' : '#1b1830'; rr(ctx, -w / 2, -h / 2, w, h, 16); ctx.fill();
+      ctx.lineWidth = sel ? 4 : 2; ctx.strokeStyle = sel ? a.color : '#3a3458'; ctx.stroke();
+      ctx.fillStyle = a.color; ctx.beginPath(); ctx.arc(0, -60, 42, 0, Math.PI * 2); ctx.fill();
+      txt(ctx, a.icon, 0, -60, 40, '#fff', 'center', false);
+      txt(ctx, a.kind, 0, 6, 13, a.stack ? '#9fe0b8' : '#d8a8ff', 'center', false);
+      txt(ctx, a.name, 0, 36, 24, '#fff');
+      txt(ctx, a.desc, 0, 72, 13, '#d4d8ea', 'center', false);
+      const have = run.counts[a.id]; if (have) txt(ctx, `보유 x${have}`, 0, 110, 12, '#8a93b0', 'center', false);
+      ctx.restore();
+    });
+    const max = run.def.hp * run.hpMul;
+    txt(ctx, `현재 체력 ${Math.ceil(run.hp)} / ${Math.round(max)}  →  다음 스테이지에서 최대 체력의 40% 회복`, W / 2, H - 70, 15, '#cfd6ea', 'center', false);
+    txt(ctx, 'A / D 선택   ·   J 결정', W / 2, H - 36, 18, '#e8ecf8');
+  }
+}
+
+class GameOverScene extends Scene {
+  constructor(g) { super(g); this.idx = 0; }
+  update() {
+    this.t++; const i = this.g.input; if (this.t < 40) { i.clear(); return; }
+    if (i.tap('a') || i.tap('d')) { this.idx = 1 - this.idx; Sound.select(); }
+    if (i.tap('j')) { Sound.confirm(); if (this.idx === 0) this.g.startRun(this.g.lastChar); else this.g.go(new SelectScene(this.g)); }
+  }
+  draw(ctx) {
+    ctx.fillStyle = '#0a0a10'; ctx.fillRect(0, 0, W, H);
+    const run = this.g.run;
+    txt(ctx, 'GAME OVER', W / 2, 130, 72, '#ff4d4d');
+    txt(ctx, `도달 스테이지: ${run.stage}`, W / 2, 210, 24, '#fff');
+    txt(ctx, `최고 기록: ${this.g.best}`, W / 2, 245, 18, '#ffe066');
+    const names = Object.keys(run.counts).map(id => AUG_BY_ID[id].name + (run.counts[id] > 1 ? ' x' + run.counts[id] : ''));
+    txt(ctx, names.length ? '획득한 증강: ' + names.join(', ') : '획득한 증강 없음', W / 2, 290, 14, '#c0c6da', 'center', false);
+    ['다시 시작', '캐릭터 선택'].forEach((s, n) => {
+      const sel = n === this.idx, x = W / 2 - 130 + n * 260, y = 380;
+      ctx.fillStyle = sel ? '#ffd23f' : '#222638'; rr(ctx, x - 110, y - 28, 220, 56, 12); ctx.fill();
+      txt(ctx, s, x, y, 22, sel ? '#1a1a1a' : '#e8ecf8', 'center', false);
+    });
+    txt(ctx, 'A / D 선택   ·   J 결정', W / 2, H - 50, 16, '#8a93b0', 'center', false);
+  }
+}
+
+// ---------- 게임 ----------
+class Game {
+  constructor(cv) {
+    this.cv = cv; this.ctx = cv.getContext('2d'); this.input = new Input();
+    this.best = 0; try { this.best = +localStorage.getItem('augArenaBest') || 0; } catch (e) {}
+    this.lastChar = 0; this.run = null;
+    this.scene = new LoadingScene(this); this.acc = 0; this.last = performance.now();
+    requestAnimationFrame(t => this.loop(t));
+  }
+  go(scene) { this.scene = scene; this.input.clear(); this.input.paused = false; }
+  loop(now) {
+    const dt = Math.min(0.25, (now - this.last) / 1000); this.last = now; this.acc += dt;
+    let n = 0;
+    while (this.acc >= STEP && n < 8) { this.scene.update(); this.input.tick(); this.acc -= STEP; n++; }
+    if (n >= 8) this.acc = 0;
+    this.scene.draw(this.ctx);
+    requestAnimationFrame(t => this.loop(t));
+  }
+  startRun(idx) {
+    const def = CHARS[idx]; this.lastChar = idx;
+    this.run = { def, stage: 1, hpMul: 1, atkMul: 1, spdMul: 1, meterMul: 1, aug: {}, counts: {}, hp: def.hp, meter: 0 };
+    this.go(new BattleScene(this));
+  }
+  nextStage() {
+    const r = this.run, max = r.def.hp * r.hpMul;
+    r.stage++; r.hp = Math.min(max, r.hp + max * 0.4);
+    this.go(new BattleScene(this));
+  }
+  saveBest(n) { if (n > this.best) { this.best = n; try { localStorage.setItem('augArenaBest', String(n)); } catch (e) {} } }
+}
+
+window.game = new Game(document.getElementById('game'));
+</script>
+</body>
+</html>
